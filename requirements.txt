@@ -1,6 +1,6 @@
 streamlit
 pandas
-openai
+openai>=1.1.0
 google-api-python-client
 google-auth
 google-auth-oauthlib

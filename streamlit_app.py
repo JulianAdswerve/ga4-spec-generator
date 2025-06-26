@@ -1,101 +1,68 @@
-# streamlit_app.py
 import streamlit as st
 import pandas as pd
-import openai
-import os
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from openai import OpenAI
+import io
 
-# --- SETUP ---
-openai.api_key = st.secrets["OPENAI_API_KEY"]  # Add this to .streamlit/secrets.toml
+# --- CONFIG ---
+st.set_page_config(page_title="GA4 Data Layer Spec Generator", layout="centered")
 
-def generate_prompt(event_name, parameters_text, notes=""):
-    return f"""
-    You are a GA4 implementation expert. Based on the following tagging plan row, generate a GA4-compatible data layer spec table.
+# --- TITLE ---
+st.title("GA4 Data Layer Spec Generator")
+st.markdown("Upload your Tags CSV to get started.")
 
-    Event Name: {event_name}
-    Web Event Parameters: {parameters_text}
-    Notes: {notes}
+# --- FILE UPLOAD ---
+uploaded_file = st.file_uploader("Upload Tags CSV", type=["csv"])
 
-    Output the spec as a table with columns:
-    - parameter
-    - scope (event-level or ecommerce.items[])
-    - type
-    - example_value
-    - notes
-    """
+# --- LOAD DATA ---
+def load_csv(file):
+    return pd.read_csv(file)
 
+# --- CALL OPENAI ---
 def call_openai(prompt):
-    response = openai.ChatCompletion.create(
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    response = client.chat.completions.create(
         model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "You are a GA4 tagging and data layer specification assistant."},
-            {"role": "user", "content": prompt}
-        ],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.4
     )
     return response.choices[0].message.content
 
-def upload_to_google_sheets(sheet_name, df):
-    credentials = service_account.Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    service = build("sheets", "v4", credentials=credentials)
-    spreadsheet = {
-        'properties': {
-            'title': sheet_name
-        }
-    }
-    sheet = service.spreadsheets().create(body=spreadsheet, fields='spreadsheetId').execute()
-    sheet_id = sheet.get('spreadsheetId')
+# --- GENERATE PROMPT ---
+def build_prompt(event_name, parameters):
+    base = f"""
+You are a GA4 implementation expert. Given the event '{event_name}' and its parameter descriptions:
 
-    # Prepare values
-    values = [df.columns.tolist()] + df.values.tolist()
-    body = {
-        'values': values
-    }
-    service.spreadsheets().values().update(
-        spreadsheetId=sheet_id,
-        range="Sheet1",
-        valueInputOption="RAW",
-        body=body
-    ).execute()
+{parameters}
 
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+Generate a data layer spec in table format with the following columns:
+- Key
+- Description
+- Data Type
+- Example Value
+- Source (e.g., dataLayer, JS variable, DOM scraping)
+"""
+    return base.strip()
 
-# --- STREAMLIT UI ---
-st.title("GA4 Data Layer Spec Generator")
-st.write("Upload your Tags CSV to get started.")
-
-uploaded_file = st.file_uploader("Upload Tags CSV", type=["csv"])
-
+# --- MAIN LOGIC ---
 if uploaded_file:
-    df_tags = pd.read_csv(uploaded_file)
-    st.subheader("Preview of Uploaded Tags")
-    st.dataframe(df_tags.head())
+    df = load_csv(uploaded_file)
+    st.subheader("Preview: Tags CSV")
+    st.dataframe(df.head())
 
-    selected_rows = st.multiselect("Select rows to generate specs for (by row number):", df_tags.index)
+    if "event_name" in df.columns:
+        unique_events = df["event_name"].unique()
+        selected_event = st.selectbox("Select an event to generate spec for:", unique_events)
 
-    if st.button("Generate Spec") and selected_rows:
-        all_results = []
-        for idx in selected_rows:
-            row = df_tags.loc[idx]
-            event_name = row.get("Event Name", "")
-            parameters = row.get("Web Event Parameters", "")
-            notes = row.get("Notes", "")
-            prompt = generate_prompt(event_name, parameters, notes)
+        if st.button("Generate Spec"):
+            param_rows = df[df["event_name"] == selected_event]
+            param_descriptions = "\n".join(
+                f"{row['parameter_name']}: {row['description']}"
+                for _, row in param_rows.iterrows()
+                if pd.notna(row['parameter_name']) and pd.notna(row['description'])
+            )
+            prompt = build_prompt(selected_event, param_descriptions)
             output = call_openai(prompt)
-            st.markdown(f"### Spec for `{event_name}`")
-            st.markdown(output)
-            try:
-                df_result = pd.read_csv(pd.compat.StringIO(output))
-                all_results.append(df_result)
-            except:
-                st.warning(f"Could not parse structured output for {event_name}. Review response above.")
-
-        if all_results:
-            final_spec = pd.concat(all_results, ignore_index=True)
-            if st.button("Upload to Google Sheets"):
-                sheet_url = upload_to_google_sheets("GA4 Spec Output", final_spec)
-                st.success(f"Uploaded to Google Sheets: [Open Sheet]({sheet_url})")
+            st.subheader("Generated Data Layer Spec")
+            st.code(output)
+    else:
+        st.warning("Your CSV must contain a column named 'event_name' to proceed.")
